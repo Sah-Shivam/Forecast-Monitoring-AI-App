@@ -1,0 +1,324 @@
+# %% [markdown]
+# # UK Wind Power Generation Analysis
+# ## Understanding Forecast Errors and Reliability
+
+# %% [markdown]
+# ### 1. Setup and Data Loading
+
+# %%
+import pandas as pd
+import numpy as np
+import requests
+import matplotlib.pyplot as plt
+import seaborn as sns
+from datetime import datetime, timedelta
+import warnings
+warnings.filterwarnings('ignore')
+
+# Set style for better visualizations
+plt.style.use('seaborn-v0_8-darkgrid')
+sns.set_palette("husl")
+
+# %%
+# Fetch actual generation data
+def fetch_actuals():
+    url = "https://bmrs.elexon.co.uk/api/datasets/FUELHH/stream"
+    params = {
+        'format': 'json',
+        'publishDateTimeFrom': '2024-01-01',
+        'publishDateTimeTo': '2024-01-31'
+    }
+    response = requests.get(url, params=params)
+    data = response.json()
+    # Filter for WIND
+    wind_data = [item for item in data if item.get('fuelType') == 'WIND']
+    df = pd.DataFrame(wind_data)
+    df['startTime'] = pd.to_datetime(df['startTime'])
+    df['generation'] = pd.to_numeric(df['generation'])
+    return df.sort_values('startTime')
+
+# Fetch forecast data
+def fetch_forecasts():
+    url = "https://bmrs.elexon.co.uk/api/datasets/WINDFOR/stream"
+    params = {
+        'format': 'json',
+        'publishDateTimeFrom': '2024-01-01',
+        'publishDateTimeTo': '2024-01-31'
+    }
+    response = requests.get(url, params=params)
+    data = response.json()
+    df = pd.DataFrame(data)
+    df['startTime'] = pd.to_datetime(df['startTime'])
+    df['publishTime'] = pd.to_datetime(df['publishTime'])
+    df['generation'] = pd.to_numeric(df['generation'])
+    return df.sort_values(['startTime', 'publishTime'])
+
+# Load data
+print("Loading actual generation data...")
+actuals_df = fetch_actuals()
+print(f"Loaded {len(actuals_df)} actual generation records")
+
+print("\nLoading forecast data...")
+forecasts_df = fetch_forecasts()
+print(f"Loaded {len(forecasts_df)} forecast records")
+
+# %% [markdown]
+# ### 2. Data Overview and Basic Statistics
+
+# %%
+# Display basic information
+print("Actual Generation Data Overview:")
+print(f"Date Range: {actuals_df['startTime'].min()} to {actuals_df['startTime'].max()}")
+print(f"Number of records: {len(actuals_df)}")
+print(f"\nGeneration Statistics (MW):")
+print(actuals_df['generation'].describe())
+
+# %%
+# Plot actual generation time series
+fig, axes = plt.subplots(2, 1, figsize=(15, 10))
+
+# Daily pattern
+actuals_df.set_index('startTime', inplace=True)
+daily_avg = actuals_df['generation'].resample('D').mean()
+
+axes[0].plot(actuals_df.index, actuals_df['generation'], alpha=0.5, linewidth=0.5, label='Half-hourly')
+axes[0].plot(daily_avg.index, daily_avg.values, 'r-', linewidth=2, label='Daily Average')
+axes[0].set_title('Wind Power Generation - January 2024', fontsize=14)
+axes[0].set_ylabel('Generation (MW)')
+axes[0].legend()
+axes[0].grid(True, alpha=0.3)
+
+# Distribution
+axes[1].hist(actuals_df['generation'].dropna(), bins=50, edgecolor='black', alpha=0.7)
+axes[1].axvline(actuals_df['generation'].mean(), color='r', linestyle='--', label=f"Mean: {actuals_df['generation'].mean():.0f} MW")
+axes[1].axvline(actuals_df['generation'].median(), color='g', linestyle='--', label=f"Median: {actuals_df['generation'].median():.0f} MW")
+axes[1].set_title('Distribution of Wind Power Generation', fontsize=14)
+axes[1].set_xlabel('Generation (MW)')
+axes[1].set_ylabel('Frequency')
+axes[1].legend()
+axes[1].grid(True, alpha=0.3)
+
+plt.tight_layout()
+plt.show()
+
+# %% [markdown]
+# ### 3. Forecast Error Analysis
+
+# %%
+# Merge actuals with latest forecast for each target time
+def calculate_forecast_errors(actuals_df, forecasts_df):
+    merged_data = []
+    
+    for target_time in actuals_df.index.unique():
+        actual_gen = actuals_df.loc[target_time, 'generation'] if target_time in actuals_df.index else None
+        
+        # Get all forecasts for this target time
+        target_forecasts = forecasts_df[forecasts_df['startTime'] == target_time]
+        
+        if not target_forecasts.empty and actual_gen is not None:
+            # Calculate forecast horizon
+            target_forecasts['horizon'] = (target_time - target_forecasts['publishTime']).dt.total_seconds() / 3600
+            
+            # Filter for 0-48 hours horizon
+            valid_forecasts = target_forecasts[(target_forecasts['horizon'] >= 0) & 
+                                              (target_forecasts['horizon'] <= 48)]
+            
+            for _, forecast in valid_forecasts.iterrows():
+                merged_data.append({
+                    'target_time': target_time,
+                    'actual': actual_gen,
+                    'forecast': forecast['generation'],
+                    'publish_time': forecast['publishTime'],
+                    'horizon': forecast['horizon'],
+                    'error': actual_gen - forecast['generation'],
+                    'absolute_error': abs(actual_gen - forecast['generation']),
+                    'percentage_error': abs((actual_gen - forecast['generation']) / actual_gen * 100) if actual_gen > 0 else np.nan
+                })
+    
+    return pd.DataFrame(merged_data)
+
+# Reset index for processing
+actuals_df_processed = actuals_df.copy()
+error_df = calculate_forecast_errors(actuals_df_processed, forecasts_df)
+print(f"Generated {len(error_df)} forecast-actual pairs")
+
+# %% [markdown]
+# ### 4. Error Statistics by Forecast Horizon
+
+# %%
+# Group errors by horizon
+horizon_stats = error_df.groupby(pd.cut(error_df['horizon'], bins=range(0, 50, 4))).agg({
+    'absolute_error': ['mean', 'median', lambda x: np.percentile(x, 95), lambda x: np.percentile(x, 99)],
+    'percentage_error': 'mean',
+    'horizon': 'count'
+}).round(2)
+
+horizon_stats.columns = ['MAE', 'Median Error', 'P95 Error', 'P99 Error', 'MAPE %', 'Count']
+print("Error Statistics by Forecast Horizon (4-hour bins):")
+print(horizon_stats)
+
+# %%
+# Plot error vs horizon
+fig, axes = plt.subplots(2, 2, figsize=(15, 12))
+
+# Error vs Horizon
+axes[0, 0].scatter(error_df['horizon'], error_df['absolute_error'], alpha=0.1, s=10)
+axes[0, 0].set_xlabel('Forecast Horizon (hours)')
+axes[0, 0].set_ylabel('Absolute Error (MW)')
+axes[0, 0].set_title('Absolute Error vs Forecast Horizon')
+axes[0, 0].grid(True, alpha=0.3)
+
+# Binned error statistics
+bins = pd.cut(error_df['horizon'], bins=20)
+binned_stats = error_df.groupby(bins)['absolute_error'].agg(['mean', 'std']).reset_index()
+binned_stats['horizon_mid'] = binned_stats['horizon'].apply(lambda x: x.mid)
+
+axes[0, 1].errorbar(binned_stats['horizon_mid'], binned_stats['mean'], 
+                     yerr=binned_stats['std'], fmt='o-', capsize=5, capthick=2)
+axes[0, 1].set_xlabel('Forecast Horizon (hours)')
+axes[0, 1].set_ylabel('Mean Absolute Error ± Std (MW)')
+axes[0, 1].set_title('Mean Error with Standard Deviation by Horizon')
+axes[0, 1].grid(True, alpha=0.3)
+
+# Error distribution at different horizons
+horizons_to_plot = [6, 12, 24, 48]
+for i, h in enumerate(horizons_to_plot):
+    mask = (error_df['horizon'] >= h-2) & (error_df['horizon'] < h+2)
+    axes[1, 0].hist(error_df[mask]['absolute_error'], bins=30, alpha=0.3, label=f'{h}hrs', density=True)
+
+axes[1, 0].set_xlabel('Absolute Error (MW)')
+axes[1, 0].set_ylabel('Density')
+axes[1, 0].set_title('Error Distribution by Horizon')
+axes[1, 0].legend()
+axes[1, 0].grid(True, alpha=0.3)
+
+# Box plot by horizon
+error_df['horizon_bin'] = pd.cut(error_df['horizon'], bins=range(0, 52, 4))
+error_df.boxplot(column='absolute_error', by='horizon_bin', ax=axes[1, 1], rot=45)
+axes[1, 1].set_xlabel('Forecast Horizon (hours)')
+axes[1, 1].set_ylabel('Absolute Error (MW)')
+axes[1, 1].set_title('Error Distribution by Horizon (Box Plot)')
+plt.suptitle('')
+axes[1, 1].grid(True, alpha=0.3)
+
+plt.tight_layout()
+plt.show()
+
+# %% [markdown]
+# ### 5. Time of Day Analysis
+
+# %%
+# Extract hour of day
+error_df['hour'] = error_df['target_time'].dt.hour
+
+# Analyze error by hour of day
+hourly_stats = error_df.groupby('hour').agg({
+    'absolute_error': ['mean', 'median', 'std'],
+    'actual': 'mean'
+}).round(2)
+
+hourly_stats.columns = ['MAE', 'Median Error', 'Std Error', 'Avg Actual']
+print("Error Statistics by Hour of Day:")
+print(hourly_stats)
+
+# %%
+# Plot hourly patterns
+fig, axes = plt.subplots(2, 1, figsize=(14, 10))
+
+# Error by hour
+hours = range(24)
+mae_by_hour = [hourly_stats.loc[h, 'MAE'] for h in hours]
+median_by_hour = [hourly_stats.loc[h, 'Median Error'] for h in hours]
+actual_by_hour = [hourly_stats.loc[h, 'Avg Actual'] for h in hours]
+
+axes[0].plot(hours, mae_by_hour, 'o-', label='MAE', linewidth=2)
+axes[0].plot(hours, median_by_hour, 's-', label='Median Error', linewidth=2)
+axes[0].set_xlabel('Hour of Day')
+axes[0].set_ylabel('Error (MW)')
+axes[0].set_title('Forecast Error by Hour of Day')
+axes[0].legend()
+axes[0].grid(True, alpha=0.3)
+axes[0].set_xticks(hours)
+
+# Actual generation by hour with error overlay
+ax2 = axes[1]
+bars = ax2.bar(hours, actual_by_hour, alpha=0.5, label='Avg Actual Generation')
+ax2.set_xlabel('Hour of Day')
+ax2.set_ylabel('Generation (MW)', color='b')
+ax2.tick_params(axis='y', labelcolor='b')
+ax2.set_title('Average Generation and Error by Hour')
+ax2.set_xticks(hours)
+
+ax3 = ax2.twinx()
+ax3.plot(hours, mae_by_hour, 'r-', linewidth=2, label='MAE')
+ax3.set_ylabel('Error (MW)', color='r')
+ax3.tick_params(axis='y', labelcolor='r')
+
+plt.tight_layout()
+plt.show()
+
+# %% [markdown]
+# ### 6. Reliability Analysis: How much wind power can we reliably expect?
+
+# %%
+# Calculate percentiles of actual generation
+percentiles = [10, 20, 30, 40, 50, 60, 70, 80, 90, 95, 99]
+percentile_values = np.percentile(actuals_df['generation'].dropna(), percentiles)
+
+reliability_df = pd.DataFrame({
+    'Percentile': percentiles,
+    'Generation (MW)': percentile_values,
+    'Probability of Exceeding (%)': [100 - p for p in percentiles]
+})
+
+print("Wind Power Reliability Analysis:")
+print(reliability_df)
+
+# %%
+# Visualize reliability curve
+fig, axes = plt.subplots(1, 2, figsize=(15, 6))
+
+# Reliability curve
+axes[0].plot([100-p for p in percentiles], percentile_values, 'bo-', linewidth=2, markersize=8)
+axes[0].set_xlabel('Probability of Exceeding (%)')
+axes[0].set_ylabel('Generation (MW)')
+axes[0].set_title('Wind Power Reliability Curve')
+axes[0].grid(True, alpha=0.3)
+axes[0].invert_xaxis()  # So higher reliability on left
+
+# Add recommendation markers
+axes[0].axhline(y=percentile_values[percentiles.index(90)], color='g', linestyle='--', 
+                label=f"P90: {percentile_values[percentiles.index(90)]:.0f} MW")
+axes[0].axhline(y=percentile_values[percentiles.index(80)], color='y', linestyle='--', 
+                label=f"P80: {percentile_values[percentiles.index(80)]:.0f} MW")
+axes[0].axhline(y=percentile_values[percentiles.index(50)], color='r', linestyle='--', 
+                label=f"P50: {percentile_values[percentiles.index(50)]:.0f} MW")
+axes[0].legend()
+
+# Cumulative distribution
+sorted_gen = np.sort(actuals_df['generation'].dropna())
+cumulative_prob = np.arange(1, len(sorted_gen) + 1) / len(sorted_gen) * 100
+
+axes[1].plot(sorted_gen, cumulative_prob, 'b-', linewidth=2)
+axes[1].set_xlabel('Generation (MW)')
+axes[1].set_ylabel('Cumulative Probability (%)')
+axes[1].set_title('Cumulative Distribution of Wind Power')
+axes[1].grid(True, alpha=0.3)
+axes[1].axhline(y=90, color='g', linestyle='--', label='90% reliability')
+axes[1].axhline(y=80, color='y', linestyle='--', label='80% reliability')
+axes[1].axhline(y=50, color='r', linestyle='--', label='50% reliability')
+axes[1].legend()
+
+plt.tight_layout()
+plt.show()
+
+# %% [markdown]
+# ### 7. Time-based Reliability Analysis
+
+# %%
+# Add hour and day info
+actuals_df['hour'] = actuals_df.index.hour
+actuals_df['day'] = actuals_df.index.day
+actuals_df['day_of_week'] = actuals_df.index.dayofweek
+
+# Calculate
