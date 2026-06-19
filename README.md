@@ -292,7 +292,5 @@ Fetches forecast and actual generation data.
 
 ## 📧 Contact
 
-For questions or feedback, please reach out to:
-- Email: your.email@example.com
-- GitHub: [@yourusername](https://github.com/yourusername)
+
 
